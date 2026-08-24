@@ -230,7 +230,14 @@ class FeatureHandler(object):
         Summary:
         Updates the state field in the FEATURE|* tables as the state field
         might have to be rendered based on DEVICE_METADATA table and generated Device Running Metadata
+
+        Uses a two-phase approach to avoid a race condition between systemctl
+        daemon-reload and Docker container startup:
+        Phase 1: Write all systemd config files, followed by daemon-reload.
+        Phase 2: Start/stop all feature services (no daemon-reloads required).
         """
+        # Phase 1: Write all systemd configs and cache features
+        syslog.syslog(syslog.LOG_INFO, "Writing systemd configs")
         for feature_name in feature_table.keys():
             if not feature_name:
                 syslog.syslog(syslog.LOG_WARNING, "Feature is None")
@@ -242,7 +249,18 @@ class FeatureHandler(object):
             feature = Feature(feature_name, feature_table[feature_name], device_config)
 
             self._cached_config.setdefault(feature_name, feature)
-            self.update_systemd_config(feature)
+            self.update_systemd_config(feature, reload=False)
+
+        # Perform daemon-reload after all configs are written
+        self.reload_systemd_config()
+
+        # Phase 2: Start/stop services without daemon-reloads
+        syslog.syslog(syslog.LOG_INFO, "Restarting services")
+        for feature_name in feature_table.keys():
+            if not feature_name:
+                syslog.syslog(syslog.LOG_WARNING, "Feature is None")
+                continue
+            feature = self._cached_config[feature_name]
             self.update_feature_state(feature)
             self.sync_feature_scope(feature)
             self.resync_feature_state(feature)
@@ -275,8 +293,12 @@ class FeatureHandler(object):
             return False
 
         if not enable and not disable:
-            syslog.syslog(syslog.LOG_ERR, "Unexpected state value '{}' for feature {}"
-                          .format(feature.state, feature.name))
+            # state=None means the FEATURE entry was deleted by a concurrent uninstall
+            # while this notification was queued — not an error.  Any other non-None
+            # value here is a genuinely unexpected state and should be flagged.
+            if feature.state is not None:
+                syslog.syslog(syslog.LOG_ERR, "Unexpected state value '{}' for feature {}"
+                              .format(feature.state, feature.name))
             return False
 
         if feature.delayed and not self.is_delayed_enabled:
@@ -359,17 +381,27 @@ class FeatureHandler(object):
         new_global = str(feature_config.has_global_scope)
         self._conditional_update_scope(self._config_db, feature_config.name, new_per_asic, new_global)
 
+        # If the entry was deleted by a concurrent deregister, _conditional_update_scope
+        # may have recreated it without a 'state' field.  Remove the partial entry to
+        # avoid a ghost record.
+        post_entry = self._config_db.get_entry(FEATURE_TBL, feature_config.name)
+        if post_entry and 'state' not in post_entry:
+            self._config_db.set_entry(FEATURE_TBL, feature_config.name, None)
+            return
+
         # Sync both has_per_asic_scope and has_global_scope to CONFIG_DB in namespaces on multi-asic platforms
         for ns, db in self.ns_cfg_db.items():
             self._conditional_update_scope(db, feature_config.name, new_per_asic, new_global)
     
-    def update_systemd_config(self, feature_config):
+    def update_systemd_config(self, feature_config, reload=True):
         """Updates `Restart=` field in feature's systemd configuration file
         according to the value of `auto_restart` field in `FEATURE` table of `CONFIG_DB`.
 
         Args:
             feature: An object represents a feature's configuration in `FEATURE`
             table of `CONFIG_DB`.
+            reload: Whether to run systemctl daemon-reload after writing config.
+            Set to False when batching multiple config updates.
 
         Returns:
             None.
@@ -407,6 +439,10 @@ class FeatureHandler(object):
             syslog.syslog(syslog.LOG_INFO, "Feature '{}' systemd config file related to auto-restart is updated!"
                           .format(feature_name))
 
+        if reload:
+            self.reload_systemd_config()
+
+    def reload_systemd_config(self):
         try:
             syslog.syslog(syslog.LOG_INFO, "Reloading systemd configuration files ...")
             run_cmd(["sudo", "systemctl", "daemon-reload"], raise_exception=True)
@@ -558,7 +594,17 @@ class FeatureHandler(object):
 
     def resync_feature_state(self, feature):
         current_entry = self._config_db.get_entry(FEATURE_TBL, feature.name)
-        current_feature_state = current_entry.get('state') if current_entry else None
+
+        # Entry was deleted by a concurrent deregister — do not recreate it.
+        if not current_entry:
+            return
+
+        # Partial entry left by sync_feature_scope racing with deregister — remove it.
+        if 'state' not in current_entry:
+            self._config_db.set_entry(FEATURE_TBL, feature.name, None)
+            return
+
+        current_feature_state = current_entry.get('state')
 
         # feature.state might be rendered from a template, so that it should resync CONFIG DB
         # FEATURE table to override the template value to valid state value

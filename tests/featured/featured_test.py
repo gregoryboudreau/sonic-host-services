@@ -282,7 +282,8 @@ class TestFeatureHandler(TestCase):
         }
         mock_db.get_entry.return_value = None
         feature_handler.sync_state_field(feature_table)
-        mock_db.mod_entry.assert_called_with('FEATURE', 'sflow', {'state': 'enabled'})
+        # Missing FEATURE row: resync_feature_state skips mod_entry (avoid recreating a row removed concurrently).
+        mock_db.mod_entry.assert_not_called()
         mock_db.mod_entry.reset_mock()
 
         feature_handler = featured.FeatureHandler(mock_db, mock_feature_state_table, {}, False)
@@ -321,7 +322,127 @@ class TestFeatureHandler(TestCase):
         }
         feature_handler.sync_state_field(feature_table)
         mock_db.mod_entry.assert_called_with('FEATURE', 'sflow', {'state': 'enabled'})
-    
+        mock_db.mod_entry.reset_mock()
+
+        # Partial entry (no 'state' key): left behind by sync_feature_scope racing with
+        # deregister.  resync_feature_state must delete it rather than completing it.
+        feature_handler = featured.FeatureHandler(mock_db, mock_feature_state_table, {}, False)
+        mock_db.get_entry.return_value = {
+            'has_per_asic_scope': 'False',
+            'has_global_scope': 'True',
+        }
+        mock_db.set_entry = mock.MagicMock()
+        feature_handler.sync_state_field(feature_table)
+        mock_db.set_entry.assert_called_with('FEATURE', 'sflow', None)
+        mock_db.mod_entry.assert_not_called()
+
+    def test_sync_feature_scope_toctou(self):
+        """sync_feature_scope must delete a partial entry it accidentally creates when
+        the FEATURE row is deleted by a concurrent deregister between the mod_entry and
+        the post-write existence check (TOCTOU)."""
+        mock_db = mock.MagicMock()
+        mock_feature_state_table = mock.MagicMock()
+
+        feature_handler = featured.FeatureHandler(mock_db, mock_feature_state_table, {}, False)
+        feature = featured.Feature('sflow', {
+            'state': 'disabled',
+            'has_global_scope': 'True',
+            'has_per_asic_scope': 'False',
+            'delayed': 'False',
+        })
+
+        # Post-write check sees a partial entry (no 'state' key): the FEATURE row was
+        # deleted by deregister and then recreated by mod_entry during the race
+        # window, leaving only the scope fields.
+        mock_db.get_entry.return_value = {
+            'has_per_asic_scope': 'False',
+            'has_global_scope': 'True',
+        }
+
+        feature_handler.sync_feature_scope(feature)
+        mock_db.set_entry.assert_called_with(featured.FEATURE_TBL, 'sflow', None)
+
+    def test_sync_state_field_two_phase_ordering(self):
+        """Verify all systemd configs are written (Phase 1) before any service
+        is started (Phase 2), with exactly one daemon-reload in between."""
+        mock_db = mock.MagicMock()
+        mock_db.get_entry = mock.MagicMock(return_value=None)
+        mock_feature_state_table = mock.MagicMock()
+
+        feature_handler = featured.FeatureHandler(mock_db, mock_feature_state_table, {}, False)
+        feature_handler.is_delayed_enabled = True
+
+        call_order = []
+
+        def track_update_systemd(feature, reload=True):
+            call_order.append(('update_systemd_config', feature.name, reload))
+
+        def track_reload():
+            call_order.append(('reload_systemd_config',))
+
+        def track_update_feature_state(feature):
+            call_order.append(('update_feature_state', feature.name))
+            return True
+
+        feature_table = {
+            'sflow': {'state': 'enabled', 'auto_restart': 'enabled'},
+            'snmp': {'state': 'enabled', 'auto_restart': 'enabled'},
+            'lldp': {'state': 'enabled', 'auto_restart': 'disabled'},
+        }
+
+        with mock.patch.object(feature_handler, 'update_systemd_config', side_effect=track_update_systemd), \
+             mock.patch.object(feature_handler, 'reload_systemd_config', side_effect=track_reload), \
+             mock.patch.object(feature_handler, 'update_feature_state', side_effect=track_update_feature_state), \
+             mock.patch.object(feature_handler, 'sync_feature_scope'), \
+             mock.patch.object(feature_handler, 'resync_feature_state'), \
+             mock.patch.object(feature_handler, 'sync_feature_delay_state'):
+            feature_handler.sync_state_field(feature_table)
+
+        systemd_calls = [c for c in call_order if c[0] == 'update_systemd_config']
+        assert len(systemd_calls) == 3
+        for c in systemd_calls:
+            assert c[2] is False, "update_systemd_config for {} should use reload=False".format(c[1])
+
+        reload_calls = [c for c in call_order if c[0] == 'reload_systemd_config']
+        assert len(reload_calls) == 1
+
+        last_config_idx = max(i for i, c in enumerate(call_order) if c[0] == 'update_systemd_config')
+        reload_idx = next(i for i, c in enumerate(call_order) if c[0] == 'reload_systemd_config')
+        state_indices = [i for i, c in enumerate(call_order) if c[0] == 'update_feature_state']
+        assert last_config_idx < reload_idx, "All config writes must complete before daemon-reload"
+        assert all(idx > reload_idx for idx in state_indices), "All service starts must happen after daemon-reload"
+
+    def test_update_systemd_config_reload_parameter(self):
+        """Verify update_systemd_config only triggers daemon-reload when reload=True (default)."""
+        mock_db = mock.MagicMock()
+        feature_handler = featured.FeatureHandler(mock_db, mock.MagicMock(), {}, False)
+        feature = featured.Feature('sflow', {'state': 'enabled', 'auto_restart': 'enabled'})
+
+        with mock.patch.object(feature_handler, 'reload_systemd_config') as mock_reload, \
+             mock.patch.object(feature_handler, 'get_multiasic_feature_instances',
+                               return_value=(['sflow'], ['service'])), \
+             mock.patch('os.path.exists', return_value=True), \
+             mock.patch('builtins.open', mock.mock_open()):
+            feature_handler.update_systemd_config(feature, reload=False)
+            mock_reload.assert_not_called()
+
+            feature_handler.update_systemd_config(feature)
+            mock_reload.assert_called_once()
+
+    def test_sync_state_field_empty_table(self):
+        """With no features, daemon-reload still fires and no services are started."""
+        mock_db = mock.MagicMock()
+        feature_handler = featured.FeatureHandler(mock_db, mock.MagicMock(), {}, False)
+
+        with mock.patch.object(feature_handler, 'update_systemd_config') as mock_config, \
+             mock.patch.object(feature_handler, 'reload_systemd_config') as mock_reload, \
+             mock.patch.object(feature_handler, 'update_feature_state') as mock_state:
+            feature_handler.sync_state_field({})
+
+        mock_config.assert_not_called()
+        mock_reload.assert_called_once()
+        mock_state.assert_not_called()
+
     def test_port_init_done_twice(self):
         """There could be multiple "PortInitDone" event in case of swss
         restart(either due to crash or due to manual operation). swss
@@ -445,6 +566,7 @@ class TestFeatureHandler(TestCase):
 
         # Host differs -> both host and namespaces should be written
         mock_db.get_entry.return_value = {
+            'state': 'enabled',
             'has_per_asic_scope': 'False',
             'has_global_scope': 'False',
         }
@@ -468,6 +590,7 @@ class TestFeatureHandler(TestCase):
 
         # Host matches but namespaces are stale -> namespaces should still be written
         mock_db.get_entry.return_value = {
+            'state': 'enabled',
             'has_per_asic_scope': 'True',
             'has_global_scope': 'True',
         }
@@ -656,7 +779,6 @@ class TestFeatureDaemon(TestCase):
                         call(['sudo', 'systemctl', 'unmask', 'dhcp_relay.service'], capture_output=True, check=True, text=True),
                         call(['sudo', 'systemctl', 'enable', 'dhcp_relay.service'], capture_output=True, check=True, text=True),
                         call(['sudo', 'systemctl', 'start', 'dhcp_relay.service'], capture_output=True, check=True, text=True),
-                        call(['sudo', 'systemctl', 'daemon-reload'], capture_output=True, check=True, text=True),
                         call(['sudo', 'systemctl', 'unmask', 'mux.service'], capture_output=True, check=True, text=True),
                         call(['sudo', 'systemctl', 'enable', 'mux.service'], capture_output=True, check=True, text=True),
                         call(['sudo', 'systemctl', 'start', 'mux.service'], capture_output=True, check=True, text=True)]
@@ -697,7 +819,6 @@ class TestFeatureDaemon(TestCase):
                         call(['sudo', 'systemctl', 'unmask', 'dhcp_relay.service'], capture_output=True, check=True, text=True),
                         call(['sudo', 'systemctl', 'enable', 'dhcp_relay.service'], capture_output=True, check=True, text=True),
                         call(['sudo', 'systemctl', 'start', 'dhcp_relay.service'], capture_output=True, check=True, text=True),
-                        call(['sudo', 'systemctl', 'daemon-reload'], capture_output=True, check=True, text=True),
                         call(['sudo', 'systemctl', 'unmask', 'mux.service'], capture_output=True, check=True, text=True),
                         call(['sudo', 'systemctl', 'enable', 'mux.service'], capture_output=True, check=True, text=True),
                         call(['sudo', 'systemctl', 'start', 'mux.service'], capture_output=True, check=True, text=True)]
@@ -723,7 +844,6 @@ class TestFeatureDaemon(TestCase):
                 call(['sudo', 'systemctl', 'unmask', 'dhcp_relay.service'], capture_output=True, check=True, text=True),
                 call(['sudo', 'systemctl', 'enable', 'dhcp_relay.service'], capture_output=True, check=True, text=True),
                 call(['sudo', 'systemctl', 'start', 'dhcp_relay.service'], capture_output=True, check=True, text=True),
-                call(['sudo', 'systemctl', 'daemon-reload'], capture_output=True, check=True, text=True),
                 call(['sudo', 'systemctl', 'unmask', 'mux.service'], capture_output=True, check=True, text=True),
                 call(['sudo', 'systemctl', 'enable', 'mux.service'], capture_output=True, check=True, text=True),
                 call(['sudo', 'systemctl', 'start', 'mux.service'], capture_output=True, check=True, text=True)]               
@@ -751,7 +871,6 @@ class TestFeatureDaemon(TestCase):
                         call(['sudo', 'systemctl', 'unmask', 'dhcp_relay.service'], capture_output=True, check=True, text=True),
                         call(['sudo', 'systemctl', 'enable', 'dhcp_relay.service'], capture_output=True, check=True, text=True),
                         call(['sudo', 'systemctl', 'start', 'dhcp_relay.service'], capture_output=True, check=True, text=True),
-                        call(['sudo', 'systemctl', 'daemon-reload'], capture_output=True, check=True, text=True),
                         call(['sudo', 'systemctl', 'unmask', 'mux.service'], capture_output=True, check=True, text=True),
                         call(['sudo', 'systemctl', 'enable', 'mux.service'], capture_output=True, check=True, text=True),
                         call(['sudo', 'systemctl', 'start', 'mux.service'], capture_output=True, check=True, text=True)]
